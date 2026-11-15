@@ -21,6 +21,7 @@ DEFAULT_CONFIG_NAMES = ("config.yaml", "config.yml")
 _DEFAULTS: list[dict[str, Any]] = [
     {"type": "virustotal", "api_key_env": "VIRUSTOTAL_API_KEY"},
     {"type": "abuseipdb", "api_key_env": "ABUSEIPDB_API_KEY"},
+    {"type": "urlhaus"},   # keyless (abuse.ch bulk feed); always enabled
 ]
 
 
