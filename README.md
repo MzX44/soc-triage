@@ -34,13 +34,39 @@ black box.
 
 | Indicator | Sources |
 |---|---|
-| **IP** | VirusTotal v3 reputation (vendor detections, ASN, country) |
+| **IP** | VirusTotal v3 + AbuseIPDB (two independent reputations, corroborated) |
 | **Domain** | VirusTotal v3 reputation + domain creation date (newly-registered signal) |
 | **CVE** | CISA KEV (actively exploited? ransomware-linked?) · EPSS (exploit probability) · NVD (CVSS) |
 
 All sources are free and licence-clean. No scraping, no dark-web crawling — the
 real-world-exploitation signal (CISA KEV + EPSS) is what commercial "zero-day
 intel" is mostly selling anyway, from an authoritative source.
+
+## Multiple sources, corroborated
+
+Reputation comes from several independent connectors, and the score reflects **how
+many agree** — one source's flag is a lead, not a verdict:
+
+- **2+ sources flag it strongly** → critical.
+- **1 strong source** → high.
+- **2 sources agree weakly** → medium.
+- **1 weak flag, others clean** → low. *(This is why `8.8.8.8` — flagged by a lone
+  VirusTotal vendor but clean on AbuseIPDB — scores LOW, not a misleading MEDIUM.)*
+
+### Add any feed without touching the code
+
+Connectors are declared in `config.yaml` (copy `config.example.yaml`). Ship with
+VirusTotal + AbuseIPDB, or point the **generic REST connector** at any key-auth
+HTTP API — name the field to read and you're done. Keys live in your environment,
+never in the YAML:
+
+```yaml
+connectors:
+  - type: virustotal
+    api_key_env: VIRUSTOTAL_API_KEY
+  - type: abuseipdb
+    api_key_env: ABUSEIPDB_API_KEY
+```
 
 ## Install
 
@@ -88,18 +114,21 @@ Bands: `0–9 informational · 10–29 low · 30–54 medium · 55–79 high · 
 ## Tests
 
 ```bash
-python tests/test_threat_intel.py   # 13 checks
-python tests/test_ioc.py            # 20 checks
+python tests/test_threat_intel.py   # CVE enrichment parsing + priority
+python tests/test_ioc.py            # classification, corroboration scoring, bands
+python tests/test_connectors.py     # each connector's verdict mapping + config loader
 ```
 
-Both run with **no network and no keys** — they feed captured samples shaped like
+All run with **no network and no keys** — they feed captured samples shaped like
 the real feeds, so they verify the parsing and the scoring, not your connectivity.
 CI runs them on every push (Python 3.10 and 3.12).
 
 ## Roadmap
 
-- [ ] Additional free enrichers (AbuseIPDB, AlienVault OTX, URLhaus)
-- [ ] Vendor-agnostic connectors (Splunk / Sentinel / Elastic) for full ticket investigation
+- [x] Multi-source corroboration (VirusTotal + AbuseIPDB)
+- [x] Config-driven, vendor-agnostic connectors (`config.yaml` + generic REST)
+- [ ] More free enrichers (AlienVault OTX, URLhaus) via config
+- [ ] Connectors for full ticket investigation (Splunk / Sentinel / Elastic)
 - [ ] CSV / STIX batch mode
 - [ ] Optional LLM narrative summary (BYO provider)
 
