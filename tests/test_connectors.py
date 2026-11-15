@@ -86,6 +86,26 @@ def test_generic_rest():
     check("declares configured support", c.handles("ip") and not c.handles("domain"))
 
 
+def test_urlhaus():
+    print("URLhaus connector (host-feed membership, no network):")
+    c = C.URLhausConnector()
+    # Inject a fake feed so no download happens.
+    c._load_hosts = lambda force=False: {"evil-malware.example", "45.146.164.110"}
+    hit = c.query("evil-malware.example", "domain")
+    check("listed host -> strong malicious", hit["verdict"] == "malicious" and hit["weight"] == "strong")
+    hit_ip = c.query("45.146.164.110", "ip")
+    check("listed IP -> strong malicious", hit_ip["weight"] == "strong")
+    miss = c.query("good-domain.example", "domain")
+    check("unlisted host -> clean", miss["verdict"] == "clean" and miss["weight"] == "none")
+    # Internal IP refused before any feed use.
+    refused = c.query("10.0.0.5", "ip")
+    check("internal IP refused", refused["available"] is False)
+    # Feed unavailable -> graceful unavailable, not a crash.
+    c._load_hosts = lambda force=False: None
+    down = c.query("anything.example", "domain")
+    check("feed down -> unavailable", down["available"] is False)
+
+
 def test_registry():
     print("Registry + build:")
     c = C.build("abuseipdb", api_key="z")
@@ -117,6 +137,7 @@ if __name__ == "__main__":
     test_virustotal_internal_refused()
     test_abuseipdb()
     test_generic_rest()
+    test_urlhaus()
     test_registry()
     test_config_loader()
     print("\nAll tests passed.")

@@ -34,8 +34,8 @@ black box.
 
 | Indicator | Sources |
 |---|---|
-| **IP** | VirusTotal v3 + AbuseIPDB (two independent reputations, corroborated) |
-| **Domain** | VirusTotal v3 reputation + domain creation date (newly-registered signal) |
+| **IP** | VirusTotal v3 + AbuseIPDB + URLhaus (three independent reputations, corroborated) |
+| **Domain** | VirusTotal v3 + URLhaus active-malware-host feed (corroborated) + domain creation date |
 | **CVE** | CISA KEV (actively exploited? ransomware-linked?) · EPSS (exploit probability) · NVD (CVSS) |
 
 All sources are free and licence-clean. No scraping, no dark-web crawling — the
@@ -66,7 +66,12 @@ connectors:
     api_key_env: VIRUSTOTAL_API_KEY
   - type: abuseipdb
     api_key_env: ABUSEIPDB_API_KEY
+  - type: urlhaus            # abuse.ch malware-host feed — NO key needed
 ```
+
+> **URLhaus needs no API key** — it uses abuse.ch's keyless bulk feed of active
+> malware-distribution hosts (cached locally, 1-hour TTL). So a fresh clone has a
+> working second source for *domains* out of the box, before you configure anything.
 
 ## Install
 
@@ -125,9 +130,10 @@ CI runs them on every push (Python 3.10 and 3.12).
 
 ## Roadmap
 
-- [x] Multi-source corroboration (VirusTotal + AbuseIPDB)
+- [x] Multi-source corroboration (VirusTotal + AbuseIPDB + URLhaus)
 - [x] Config-driven, vendor-agnostic connectors (`config.yaml` + generic REST)
-- [ ] More free enrichers (AlienVault OTX, URLhaus) via config
+- [x] Keyless domain corroboration (URLhaus)
+- [ ] More free enrichers (AlienVault OTX, Spamhaus DROP) via config
 - [ ] Connectors for full ticket investigation (Splunk / Sentinel / Elastic)
 - [ ] CSV / STIX batch mode
 - [ ] Optional LLM narrative summary (BYO provider)
