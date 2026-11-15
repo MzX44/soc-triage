@@ -87,23 +87,40 @@ def test_generic_rest():
 
 
 def test_urlhaus():
-    print("URLhaus connector (host-feed membership, no network):")
-    c = C.URLhausConnector()
-    # Inject a fake feed so no download happens.
-    c._load_hosts = lambda force=False: {"evil-malware.example", "45.146.164.110"}
-    hit = c.query("evil-malware.example", "domain")
-    check("listed host -> strong malicious", hit["verdict"] == "malicious" and hit["weight"] == "strong")
-    hit_ip = c.query("45.146.164.110", "ip")
-    check("listed IP -> strong malicious", hit_ip["weight"] == "strong")
-    miss = c.query("good-domain.example", "domain")
-    check("unlisted host -> clean", miss["verdict"] == "clean" and miss["weight"] == "none")
-    # Internal IP refused before any feed use.
-    refused = c.query("10.0.0.5", "ip")
-    check("internal IP refused", refused["available"] is False)
-    # Feed unavailable -> graceful unavailable, not a crash.
-    c._load_hosts = lambda force=False: None
-    down = c.query("anything.example", "domain")
-    check("feed down -> unavailable", down["available"] is False)
+    print("URLhaus connector (host API, no network):")
+    c = C.URLhausConnector(api_key="k")
+    # Patch requests.post via the module so no network is used.
+    def fake_post(payload):
+        return lambda url, data=None, headers=None, timeout=None: _FakeResp(payload)
+
+    orig_post = C.requests.post
+    try:
+        # Active (online) malware URLs -> strong.
+        C.requests.post = fake_post({"query_status": "ok", "url_count": 3,
+            "urls": [{"url_status": "online"}, {"url_status": "offline"}]})
+        hit = c.query("evil-malware.example", "domain")
+        check("online malware URL -> strong", hit["verdict"] == "malicious" and hit["weight"] == "strong")
+
+        # Only historical (offline) URLs -> weak.
+        C.requests.post = fake_post({"query_status": "ok", "url_count": 2,
+            "urls": [{"url_status": "offline"}, {"url_status": "offline"}]})
+        hist = c.query("old-bad.example", "domain")
+        check("historical only -> weak", hist["verdict"] == "malicious" and hist["weight"] == "weak")
+
+        # No results -> clean.
+        C.requests.post = fake_post({"query_status": "no_results"})
+        clean = c.query("good-domain.example", "domain")
+        check("no_results -> clean", clean["verdict"] == "clean" and clean["weight"] == "none")
+
+        # Internal IP refused before any call.
+        refused = c.query("10.0.0.5", "ip")
+        check("internal IP refused", refused["available"] is False)
+
+        # No key -> unavailable, no call.
+        nokey = C.URLhausConnector(api_key=None).query("x.example", "domain")
+        check("no key -> unavailable", nokey["available"] is False and "AUTH_KEY" in nokey["detail"])
+    finally:
+        C.requests.post = orig_post
 
 
 def test_registry():

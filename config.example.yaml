@@ -14,7 +14,8 @@ connectors:
   - type: abuseipdb
     api_key_env: ABUSEIPDB_API_KEY        # IP abuse confidence (free key at abuseipdb.com)
 
-  - type: urlhaus                         # abuse.ch active-malware-host feed; NO key needed
+  - type: urlhaus                         # abuse.ch malware-host lookup
+    api_key_env: URLHAUS_AUTH_KEY         # FREE Auth-Key at auth.abuse.ch
                                           # (gives domains a second, corroborating opinion)
 
   # Add ANY key-auth HTTP feed with no new code. Example (disabled by default --

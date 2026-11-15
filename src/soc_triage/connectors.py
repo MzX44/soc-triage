@@ -25,19 +25,12 @@ feeds by editing YAML, not Python.
 from __future__ import annotations
 
 import os
-import time
-import tempfile
 import ipaddress
-from pathlib import Path
-from urllib.parse import urlparse
 from typing import Any
 
 import requests
 
 HTTP_TIMEOUT = 30
-
-# Shared on-disk cache dir (also used by threat_intel for the KEV catalogue).
-_CACHE_DIR = Path(os.getenv("SOC_CACHE_DIR", Path(tempfile.gettempdir()) / "soc_agent_cache"))
 
 _PRIVATE_NETS = [
     ipaddress.ip_network("10.0.0.0/8"),
@@ -263,55 +256,23 @@ class GenericRestConnector(Connector):
 
 
 # --------------------------------------------------------------------------- #
-# URLhaus (abuse.ch)  --  keyless bulk feed of ACTIVE malware-distribution hosts
+# URLhaus (abuse.ch)  --  per-host malware-URL lookup via the authenticated API
 # --------------------------------------------------------------------------- #
 @register
 class URLhausConnector(Connector):
-    """Flags an IP or domain that is hosting live malware URLs, per abuse.ch.
+    """Flags an IP or domain that hosts malware URLs, per abuse.ch URLhaus.
 
-    Uses the KEYLESS plaintext feed of currently-online malware URLs (not the
-    newer authenticated JSON API), so it works the moment the repo is cloned.
-    The feed is downloaded once and cached on disk with a 1-hour TTL, so a run
-    does not re-download it per indicator. Gives domains a second, independent
+    Uses the URLhaus host API (urlhaus-api.abuse.ch/v1/host/). As of 2024-25
+    abuse.ch requires a FREE Auth-Key for all of its services, so this needs
+    URLHAUS_AUTH_KEY in the environment (get one free at auth.abuse.ch). A host
+    currently serving live malware URLs is a strong signal; a host with only
+    historical (offline) URLs is a weak one. Gives domains a second, independent
     opinion -- the first corroborating source for domain indicators.
     """
     name = "urlhaus"
     supports = ("ip", "domain")
 
-    FEED_URL = "https://urlhaus.abuse.ch/downloads/text_online/"
-    CACHE = _CACHE_DIR / "urlhaus_hosts.txt"
-    TTL_SECONDS = 60 * 60
-
-    def _load_hosts(self, force: bool = False) -> set[str] | None:
-        """Return the set of hosting malware hosts, or None if unavailable."""
-        if not force and self.CACHE.exists():
-            if time.time() - self.CACHE.stat().st_mtime < self.TTL_SECONDS:
-                try:
-                    return set(self.CACHE.read_text().split())
-                except OSError:
-                    pass
-        r = self._get(self.FEED_URL)
-        if r is None or r.status_code != 200:
-            if self.CACHE.exists():  # fall back to a stale cache rather than nothing
-                try:
-                    return set(self.CACHE.read_text().split())
-                except OSError:
-                    return None
-            return None
-        hosts: set[str] = set()
-        for line in r.text.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            host = urlparse(line).hostname
-            if host:
-                hosts.add(host.lower())
-        try:
-            _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            self.CACHE.write_text("\n".join(sorted(hosts)))
-        except OSError:
-            pass
-        return hosts
+    API_URL = "https://urlhaus-api.abuse.ch/v1/host/"
 
     def query(self, indicator: str, indicator_type: str) -> dict[str, Any]:
         host = indicator.strip().strip(".").lower()
@@ -319,14 +280,38 @@ class URLhausConnector(Connector):
             return {"source": "URLhaus", "available": False, "found": False,
                     "verdict": "unknown", "weight": "none",
                     "detail": f"{host} is internal/CGNAT; not queried.", "raw": {}}
-        hosts = self._load_hosts()
-        if hosts is None:
-            return _unavailable("URLhaus", "feed unreachable (no cache).")
-        if host in hosts:
+        if not self.api_key:
+            return _unavailable("URLhaus", "URLHAUS_AUTH_KEY not set.")
+        try:
+            r = requests.post(self.API_URL, data={"host": host},
+                              headers={"Auth-Key": self.api_key}, timeout=HTTP_TIMEOUT)
+        except requests.RequestException:
+            return _unavailable("URLhaus", "unreachable.")
+        if r.status_code != 200:
+            return _unavailable("URLhaus", f"HTTP {r.status_code}.")
+        try:
+            data = r.json()
+        except ValueError:
+            return _unavailable("URLhaus", "non-JSON response.")
+        status = data.get("query_status")
+        if status == "no_results":
             return {"source": "URLhaus", "available": True, "found": True,
-                    "verdict": "malicious", "weight": "strong",
-                    "detail": "listed as an active malware-distribution host.",
-                    "raw": {"feed": "urlhaus text_online"}}
+                    "verdict": "clean", "weight": "none",
+                    "detail": "no malware URLs recorded for this host.", "raw": {}}
+        if status != "ok":
+            return _unavailable("URLhaus", data.get("error") or status or "unexpected response.")
+        urls = data.get("urls") or []
+        online = [u for u in urls if str(u.get("url_status")) == "online"]
+        count = data.get("url_count") or len(urls)
+        if online:
+            verdict, weight = "malicious", "strong"
+            detail = f"{len(online)} active (online) malware URL(s) hosted here."
+        elif urls:
+            verdict, weight = "malicious", "weak"
+            detail = f"{count} historical malware URL(s); none currently online."
+        else:
+            verdict, weight = "clean", "none"
+            detail = "listed but no malware URLs returned."
         return {"source": "URLhaus", "available": True, "found": True,
-                "verdict": "clean", "weight": "none",
-                "detail": "not in the active malware-URL feed.", "raw": {}}
+                "verdict": verdict, "weight": weight, "detail": detail,
+                "raw": {"url_count": count, "blacklists": data.get("blacklists")}}

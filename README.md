@@ -66,12 +66,14 @@ connectors:
     api_key_env: VIRUSTOTAL_API_KEY
   - type: abuseipdb
     api_key_env: ABUSEIPDB_API_KEY
-  - type: urlhaus            # abuse.ch malware-host feed — NO key needed
+  - type: urlhaus            # abuse.ch malware-host lookup
+    api_key_env: URLHAUS_AUTH_KEY
 ```
 
-> **URLhaus needs no API key** — it uses abuse.ch's keyless bulk feed of active
-> malware-distribution hosts (cached locally, 1-hour TTL). So a fresh clone has a
-> working second source for *domains* out of the box, before you configure anything.
+> **URLhaus needs a free abuse.ch Auth-Key** (grab one at auth.abuse.ch) — abuse.ch
+> moved all of its services behind free authentication in 2024–25. It gives *domains*
+> a second, independent opinion. Without the key it's simply skipped; the other
+> sources still run.
 
 ## Install
 
@@ -132,7 +134,7 @@ CI runs them on every push (Python 3.10 and 3.12).
 
 - [x] Multi-source corroboration (VirusTotal + AbuseIPDB + URLhaus)
 - [x] Config-driven, vendor-agnostic connectors (`config.yaml` + generic REST)
-- [x] Keyless domain corroboration (URLhaus)
+- [x] Domain corroboration (URLhaus host API)
 - [ ] More free enrichers (AlienVault OTX, Spamhaus DROP) via config
 - [ ] Connectors for full ticket investigation (Splunk / Sentinel / Elastic)
 - [ ] CSV / STIX batch mode
