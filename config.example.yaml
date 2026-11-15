@@ -1,0 +1,27 @@
+# soc-triage connector configuration.
+# Copy to config.yaml to customise. If no config.yaml exists, the tool defaults
+# to VirusTotal + AbuseIPDB (each used only when its API key is in the env).
+#
+# API KEYS ARE NEVER WRITTEN HERE. Each connector names an environment variable
+# (api_key_env); put the real key in your .env / shell environment. A connector
+# whose key is missing is silently skipped, so the tool runs with whatever
+# credentials you actually have.
+
+connectors:
+  - type: virustotal
+    api_key_env: VIRUSTOTAL_API_KEY       # IP + domain reputation
+
+  - type: abuseipdb
+    api_key_env: ABUSEIPDB_API_KEY        # IP abuse confidence (free key at abuseipdb.com)
+
+  # Add ANY key-auth HTTP feed with no new code. Example (disabled by default --
+  # uncomment and point at a real endpoint):
+  #
+  # - type: generic_rest
+  #   name: MyThreatFeed
+  #   supports: [ip, domain]
+  #   url: "https://api.myfeed.example/v1/lookup/{indicator}"
+  #   auth_header: "X-Api-Key"
+  #   api_key_env: MYFEED_API_KEY
+  #   malicious_field: "data.malicious_count"   # dotted path into the JSON response
+  #   malicious_strong_at: 3                      # >= this count -> "strong" signal

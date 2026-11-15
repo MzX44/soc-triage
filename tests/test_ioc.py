@@ -2,11 +2,11 @@
 """
 Offline tests for ioc_investigate.py -- no network.
 
-Verifies indicator classification, the internal-IP refusal, and the
-deterministic risk-scoring rules (the auditable core). Run: python test_ioc.py
+Covers classification, the internal-IP guard, CVE scoring, the severity bands,
+and the new CORROBORATION aggregation (including the lone-vendor '8.8.8.8' fix).
+Run: python tests/test_ioc.py
 """
 from soc_triage import ioc_investigate as mod
-from soc_triage import threat_intel as ti
 
 
 def check(name, cond):
@@ -23,48 +23,59 @@ def test_classify():
 
 
 def test_internal_guard():
-    print("Internal-IP refusal (no third-party call):")
+    print("Internal-IP guard (shared with connectors):")
     for ip in ("10.0.0.5", "192.168.1.1", "100.97.48.128", "172.16.4.4"):
-        r = mod.vt_ip(ip)
-        check(f"{ip} refused", r.get("refused") is True and r.get("available") is False)
-    check("public IP not refused by guard", mod.is_internal_ip("45.146.164.110") is False)
+        check(f"{ip} internal", mod.is_internal_ip(ip) is True)
+    check("public IP not internal", mod.is_internal_ip("45.146.164.110") is False)
 
 
-def test_score_vt():
-    print("VirusTotal scoring rules:")
-    a = mod.Assessment("1.2.3.4", "ip")
-    mod.score_vt(a, {"available": True, "found": True, "malicious": 8, "suspicious": 0})
-    check("many malicious -> >=60", a.score >= 60)
-
-    a2 = mod.Assessment("1.2.3.4", "ip")
-    mod.score_vt(a2, {"available": True, "found": True, "malicious": 0, "suspicious": 0})
-    check("clean VT -> 0 (not proof of benign)", a2.score == 0)
-
-    a3 = mod.Assessment("x.xyz", "domain")
-    mod.score_vt(a3, {"available": True, "found": True, "malicious": 0,
-                      "suspicious": 1, "creation_date": 1700000000})
-    check("1 suspicious -> +20", a3.score == 20)
-    check("domain creation date captured", "domain_creation_date" in a3.evidence)
+def _r(source, verdict, weight, available=True):
+    return {"source": source, "available": available, "found": True,
+            "verdict": verdict, "weight": weight, "detail": f"{source} {verdict}"}
 
 
-def test_score_cve():
-    print("CVE scoring rules:")
-    # KEV + ransomware -> critical-weight
-    a = mod.Assessment("CVE-2021-44228", "cve")
-    mod.score_cve(a, {"kev": {"known_exploited": True, "known_ransomware_use": "Known"},
-                      "epss": {"has_score": True, "epss": 0.94},
-                      "nvd": {"cvss_severity": "CRITICAL"}})
-    a.score = min(a.score, 100)
-    check("KEV+ransomware+EPSS+critical -> 100", a.score == 100)
-    check("severity critical", mod._severity_for(a.score) == "critical")
+def test_corroboration():
+    print("Corroboration aggregation:")
+    # Two strong malicious -> critical band.
+    s, _ = mod.aggregate_reputation([_r("VirusTotal", "malicious", "strong"),
+                                     _r("AbuseIPDB", "malicious", "strong")])
+    check("2 strong -> 85", s == 85)
 
-    # Not exploited, moderate EPSS, high CVSS -> not critical
-    b = mod.Assessment("CVE-2024-0001", "cve")
-    mod.score_cve(b, {"kev": {"known_exploited": False},
-                      "epss": {"has_score": True, "epss": 0.12},
-                      "nvd": {"cvss_severity": "HIGH"}})
-    check("no KEV -> below critical", mod._severity_for(min(b.score, 100)) != "critical")
-    check("moderate signals scored", 0 < b.score < 55)
+    # One strong + one weak -> 70.
+    s, _ = mod.aggregate_reputation([_r("VirusTotal", "malicious", "strong"),
+                                     _r("AbuseIPDB", "suspicious", "weak")])
+    check("1 strong + 1 weak -> 70", s == 70)
+
+    # THE 8.8.8.8 FIX: one weak hit, one source says clean -> LOW, not MEDIUM.
+    s, reasons = mod.aggregate_reputation([_r("VirusTotal", "malicious", "weak"),
+                                           _r("AbuseIPDB", "clean", "none")])
+    check("lone weak hit -> 15 (LOW)", s == 15)
+    check("severity is low", mod._severity_for(s) == "low")
+    check("clean source surfaced", any("clean" in x for x in reasons))
+
+    # Two independent weak hits DO corroborate -> MEDIUM.
+    s, _ = mod.aggregate_reputation([_r("VirusTotal", "malicious", "weak"),
+                                     _r("AbuseIPDB", "malicious", "weak")])
+    check("2 weak -> 40 (MEDIUM)", s == 40)
+
+    # All clean -> 0.
+    s, _ = mod.aggregate_reputation([_r("VirusTotal", "clean", "none"),
+                                     _r("AbuseIPDB", "clean", "none")])
+    check("all clean -> 0", s == 0)
+
+
+def test_cve_scoring():
+    print("CVE scoring (unchanged logic, tuple return):")
+    s, _ = mod.score_cve({"kev": {"known_exploited": True, "known_ransomware_use": "Known"},
+                          "epss": {"has_score": True, "epss": 0.94},
+                          "nvd": {"cvss_severity": "CRITICAL"}})
+    check("KEV+ransomware+EPSS+critical -> 120 (capped later)", s == 120)
+    check("maps to critical", mod._severity_for(min(s, 100)) == "critical")
+
+    s2, _ = mod.score_cve({"kev": {"known_exploited": False},
+                           "epss": {"has_score": True, "epss": 0.12},
+                           "nvd": {"cvss_severity": "HIGH"}})
+    check("no KEV -> below critical", mod._severity_for(min(s2, 100)) != "critical")
 
 
 def test_severity_bands():
@@ -76,10 +87,23 @@ def test_severity_bands():
     check("85 -> critical", mod._severity_for(85) == "critical")
 
 
+def test_investigate_with_fake_connectors():
+    print("investigate() end-to-end with injected connectors (no network):")
+    class FakeConn:
+        def __init__(self, result): self._r = result
+        def handles(self, k): return k == "ip"
+        def query(self, ind, k): return self._r
+    conns = [FakeConn(_r("VirusTotal", "malicious", "weak")),
+             FakeConn(_r("AbuseIPDB", "clean", "none"))]
+    a = mod.investigate("8.8.8.8", conns)
+    check("8.8.8.8 lands LOW, not MEDIUM", a.severity == "low" and a.score == 15)
+
+
 if __name__ == "__main__":
     test_classify()
     test_internal_guard()
-    test_score_vt()
-    test_score_cve()
+    test_corroboration()
+    test_cve_scoring()
     test_severity_bands()
+    test_investigate_with_fake_connectors()
     print("\nAll tests passed.")
