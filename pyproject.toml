@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "soc-triage"
+version = "0.1.0"
+description = "Public-source IOC triage: risk-scored IP / domain / CVE assessment with a deterministic, auditable verdict."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Antonio Misztal" }]
+keywords = ["security", "soc", "threat-intelligence", "ioc", "cve", "triage"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Security",
+    "Intended Audience :: Information Technology",
+]
+
+# Pinned to known-good lower bounds so the tool keeps running for months without
+# a surprise upstream break. The core has only two runtime dependencies.
+dependencies = [
+    "requests>=2.31,<3",
+    "python-dotenv>=1.0,<2",
+]
+
+[project.optional-dependencies]
+# The LLM agent half (lab/SIEM orchestration) is optional and not needed for
+# standalone IOC triage.
+agent = [
+    "langchain>=0.3,<0.4",
+    "langchain-google-genai>=2,<3",
+]
+
+[project.scripts]
+# After `pip install .` this gives you a real command on your PATH.
+ioc-triage = "soc_triage.ioc_investigate:main"
+
+[project.urls]
+Homepage = "https://github.com/MzX44/soc-triage"
+Issues = "https://github.com/MzX44/soc-triage/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
