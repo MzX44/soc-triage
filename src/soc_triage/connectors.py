@@ -23,33 +23,90 @@ from __future__ import annotations
 
 import time
 import ipaddress
+from urllib.parse import quote
 from typing import Any
 
 import requests
 
 HTTP_TIMEOUT = 30
+RETRIES = 3
+BACKOFF = 1.5          # base seconds for exponential backoff
+MAX_BACKOFF = 20.0     # cap on a single sleep
 
-_PRIVATE_NETS = [
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("100.64.0.0/10"),
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("169.254.0.0/16"),
-]
+
+def _retry_after(resp: requests.Response) -> float | None:
+    """Seconds to wait from a Retry-After header, if present and numeric."""
+    val = resp.headers.get("Retry-After")
+    if not val:
+        return None
+    try:
+        return float(val)
+    except ValueError:
+        return None
+
+# CGNAT (RFC 6598) is classified as neither private nor global by the standard
+# library, so it needs an explicit check alongside is_global.
+_CGNAT = ipaddress.ip_network("100.64.0.0/10")
+
+# Hostname suffixes and labels that denote internal/private infrastructure and
+# must never be sent to a third party.
+_INTERNAL_HOST_SUFFIXES = (
+    ".local", ".internal", ".intranet", ".corp", ".lan", ".home",
+    ".localdomain", ".home.arpa", ".in-addr.arpa", ".ip6.arpa",
+)
 
 
 def is_internal_ip(value: str) -> bool:
+    """True if value is a non-public IP that must not leave the network.
+
+    Uses the standard library's address classification so it covers private,
+    loopback, link-local, reserved and documentation ranges for both IPv4 and
+    IPv6, unwraps IPv4-mapped IPv6 (e.g. ``::ffff:10.0.0.5``), and treats CGNAT
+    (100.64.0.0/10) as internal.
+    """
     try:
         ip = ipaddress.ip_address(value.strip())
     except ValueError:
         return False
-    return any(ip in net for net in _PRIVATE_NETS)
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    if ip.version == 4 and ip in _CGNAT:
+        return True
+    return not ip.is_global
+
+
+def is_internal_host(value: str) -> bool:
+    """True if a domain/hostname denotes internal infrastructure, so it must not
+    be sent to a third party. Covers internal TLD suffixes, single-label names
+    (e.g. ``dc01``), and ``localhost``."""
+    host = value.strip().strip(".").lower()
+    if not host:
+        return False
+    if host == "localhost" or host.endswith(_INTERNAL_HOST_SUFFIXES):
+        return True
+    # A single-label hostname (no dot) is not a public domain.
+    return "." not in host
 
 
 def _unavailable(source: str, note: str) -> dict[str, Any]:
     return {"source": source, "available": False, "found": False,
             "verdict": "unknown", "weight": "none", "detail": note, "raw": {}}
+
+
+def _refused_internal(source: str, indicator: str) -> dict[str, Any]:
+    return {"source": source, "available": False, "found": False, "refused": True,
+            "verdict": "unknown", "weight": "none",
+            "detail": f"{indicator} is internal/non-public; not queried.", "raw": {}}
+
+
+def is_private_indicator(indicator: str, indicator_type: str) -> bool:
+    """True if an IP or domain indicator is internal and must not be sent out."""
+    if indicator_type == "ip":
+        return is_internal_ip(indicator)
+    if indicator_type == "domain":
+        return is_internal_host(indicator)
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -59,24 +116,47 @@ class Connector:
     """Base class. Subclasses set `name`, `supports`, and implement query()."""
     name: str = "connector"
     supports: tuple[str, ...] = ()          # e.g. ("ip", "domain")
+    commercial_ok: bool = False             # may this source back a paid product?
 
     def __init__(self, *, api_key: str | None = None, **opts: Any) -> None:
         self.api_key = api_key
         self.opts = opts
+        self._cache: dict[tuple[str, str], dict[str, Any]] = {}
 
     def handles(self, indicator_type: str) -> bool:
         return indicator_type in self.supports
 
+    def lookup(self, indicator: str, indicator_type: str) -> dict[str, Any]:
+        """Cached wrapper around query(): a repeated indicator in one run costs
+        one request per source, not one per occurrence."""
+        key = (indicator_type, indicator)
+        if key not in self._cache:
+            self._cache[key] = self.query(indicator, indicator_type)
+        return self._cache[key]
+
     def query(self, indicator: str, indicator_type: str) -> dict[str, Any]:
         raise NotImplementedError
 
-    # Shared HTTP helper.
-    def _get(self, url: str, **kw: Any) -> requests.Response | None:
+    def _request(self, method: str, url: str, **kw: Any) -> requests.Response | None:
+        """HTTP with bounded retry + exponential backoff, honouring Retry-After
+        on 429/503. Returns the Response, or None if unreachable after retries."""
         kw.setdefault("timeout", HTTP_TIMEOUT)
-        try:
-            return requests.get(url, **kw)
-        except requests.RequestException:
-            return None
+        for attempt in range(RETRIES):
+            try:
+                r = requests.request(method, url, **kw)
+            except requests.RequestException:
+                if attempt == RETRIES - 1:
+                    return None
+                time.sleep(min(BACKOFF * (2 ** attempt), MAX_BACKOFF))
+                continue
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < RETRIES - 1:
+                time.sleep(min(_retry_after(r) or BACKOFF * (2 ** attempt), MAX_BACKOFF))
+                continue
+            return r
+        return None
+
+    def _get(self, url: str, **kw: Any) -> requests.Response | None:
+        return self._request("GET", url, **kw)
 
 
 _REGISTRY: dict[str, type[Connector]] = {}
@@ -102,10 +182,8 @@ class VirusTotalConnector(Connector):
     supports = ("ip", "domain")
 
     def query(self, indicator: str, indicator_type: str) -> dict[str, Any]:
-        if indicator_type == "ip" and is_internal_ip(indicator):
-            return {"source": "VirusTotal", "available": False, "found": False,
-                    "verdict": "unknown", "weight": "none",
-                    "detail": f"{indicator} is internal/CGNAT; not queried.", "raw": {}}
+        if is_private_indicator(indicator, indicator_type):
+            return _refused_internal("VirusTotal", indicator)
         if not self.api_key:
             return _unavailable("VirusTotal", "VIRUSTOTAL_API_KEY not set.")
         path = "ip_addresses" if indicator_type == "ip" else "domains"
@@ -158,9 +236,7 @@ class AbuseIPDBConnector(Connector):
 
     def query(self, indicator: str, indicator_type: str) -> dict[str, Any]:
         if is_internal_ip(indicator):
-            return {"source": "AbuseIPDB", "available": False, "found": False,
-                    "verdict": "unknown", "weight": "none",
-                    "detail": f"{indicator} is internal/CGNAT; not queried.", "raw": {}}
+            return _refused_internal("AbuseIPDB", indicator)
         if not self.api_key:
             return _unavailable("AbuseIPDB", "ABUSEIPDB_API_KEY not set.")
         r = self._get("https://api.abuseipdb.com/api/v2/check",
@@ -173,12 +249,12 @@ class AbuseIPDBConnector(Connector):
         d = r.json().get("data", {})
         conf = int(d.get("abuseConfidenceScore", 0))
         reports = int(d.get("totalReports", 0))
+        # Below 25% confidence AbuseIPDB reports are treated as no signal, so a
+        # handful of low-confidence reports cannot, on their own, raise a verdict.
         if conf >= 50:
             verdict, weight = "malicious", "strong"
         elif conf >= 25:
             verdict, weight = "malicious", "weak"
-        elif conf > 0:
-            verdict, weight = "suspicious", "weak"
         else:
             verdict, weight = "clean", "none"
         return {
@@ -213,6 +289,7 @@ class GenericRestConnector(Connector):
     def __init__(self, *, display_name: str = "GenericFeed", url: str = "",
                  supports: list[str] | None = None, auth_header: str | None = None,
                  malicious_field: str = "", malicious_strong_at: int = 3,
+                 commercial_ok: bool = False,
                  api_key: str | None = None, **opts: Any) -> None:
         super().__init__(api_key=api_key, **opts)
         self.display_name = display_name
@@ -221,6 +298,7 @@ class GenericRestConnector(Connector):
         self.auth_header = auth_header
         self.malicious_field = malicious_field
         self.malicious_strong_at = malicious_strong_at
+        self.commercial_ok = commercial_ok
 
     @staticmethod
     def _dig(obj: Any, dotted: str) -> Any:
@@ -232,14 +310,15 @@ class GenericRestConnector(Connector):
         return obj
 
     def query(self, indicator: str, indicator_type: str) -> dict[str, Any]:
-        if indicator_type == "ip" and is_internal_ip(indicator):
-            return {"source": self.display_name, "available": False, "found": False,
-                    "verdict": "unknown", "weight": "none",
-                    "detail": f"{indicator} is internal/CGNAT; not queried.", "raw": {}}
+        if is_private_indicator(indicator, indicator_type):
+            return _refused_internal(self.display_name, indicator)
         headers = {}
         if self.auth_header and self.api_key:
             headers[self.auth_header] = self.api_key
-        r = self._get(self.url.format(indicator=indicator), headers=headers or None)
+        # URL-encode the indicator so it cannot inject path segments or query
+        # parameters into the configured feed URL.
+        url = self.url.format(indicator=quote(indicator, safe=""))
+        r = self._get(url, headers=headers or None)
         if r is None or r.status_code != 200:
             return _unavailable(self.display_name,
                                 f"HTTP {getattr(r, 'status_code', 'unreachable')}.")
@@ -281,16 +360,13 @@ class URLhausConnector(Connector):
 
     def query(self, indicator: str, indicator_type: str) -> dict[str, Any]:
         host = indicator.strip().strip(".").lower()
-        if indicator_type == "ip" and is_internal_ip(host):
-            return {"source": "URLhaus", "available": False, "found": False,
-                    "verdict": "unknown", "weight": "none",
-                    "detail": f"{host} is internal/CGNAT; not queried.", "raw": {}}
+        if is_private_indicator(indicator, indicator_type):
+            return _refused_internal("URLhaus", indicator)
         if not self.api_key:
             return _unavailable("URLhaus", "URLHAUS_AUTH_KEY not set.")
-        try:
-            r = requests.post(self.API_URL, data={"host": host},
-                              headers={"Auth-Key": self.api_key}, timeout=HTTP_TIMEOUT)
-        except requests.RequestException:
+        r = self._request("POST", self.API_URL, data={"host": host},
+                          headers={"Auth-Key": self.api_key})
+        if r is None:
             return _unavailable("URLhaus", "unreachable.")
         if r.status_code != 200:
             return _unavailable("URLhaus", f"HTTP {r.status_code}.")

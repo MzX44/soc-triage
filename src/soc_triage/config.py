@@ -2,16 +2,22 @@
 """
 config.py  --  load the enabled enrichment connectors from config.yaml.
 
-If no config file is found, falls back to sensible defaults (VirusTotal +
-AbuseIPDB), each enabled only when its API key is present in the environment.
-API keys are NEVER written in the YAML -- the YAML names an environment variable
+If no config file is found, falls back to defaults (VirusTotal, AbuseIPDB and
+URLhaus), each enabled only when its API key is present in the environment. API
+keys are NEVER written in the YAML -- the YAML names an environment variable
 (`api_key_env`) and the key is read from there at load time.
+
+A commercial deployment can set `require_commercial_use: true` at the top of
+config.yaml to drop any source whose terms forbid commercial use (see each
+connector's `commercial_ok` flag and the licensing table in the README).
 """
 from __future__ import annotations
 
 import os
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 from . import connectors as C
 
@@ -39,6 +45,7 @@ def _instantiate(entry: dict[str, Any]) -> C.Connector:
             auth_header=entry.get("auth_header"),
             malicious_field=entry.get("malicious_field", ""),
             malicious_strong_at=int(entry.get("malicious_strong_at", 3)),
+            commercial_ok=bool(entry.get("commercial_ok", False)),
         )
     return C.build(ctype, **opts)
 
@@ -62,22 +69,20 @@ def load_connectors(config_path: str | None = None) -> list[C.Connector]:
     """
     path = _find_config(config_path)
     entries: list[dict[str, Any]] = _DEFAULTS
+    require_commercial = False
     if path is not None:
-        try:
-            import yaml  # optional dependency; only needed for a custom config
-        except ImportError as e:
-            raise RuntimeError(
-                "config.yaml found but PyYAML is not installed. "
-                "Run: pip install pyyaml") from e
         doc = yaml.safe_load(path.read_text()) or {}
         entries = doc.get("connectors", _DEFAULTS)
+        require_commercial = bool(doc.get("require_commercial_use", False))
 
     built: list[C.Connector] = []
     for entry in entries:
         conn = _instantiate(entry)
         # Drop a key-auth connector that has no key, so it is silently skipped.
-        needs_key = bool(entry.get("api_key_env"))
-        if needs_key and not conn.api_key:
+        if entry.get("api_key_env") and not conn.api_key:
+            continue
+        # In a commercial deployment, drop sources whose terms forbid it.
+        if require_commercial and not conn.commercial_ok:
             continue
         built.append(conn)
     return built
