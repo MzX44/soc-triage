@@ -8,9 +8,8 @@ CVE; it gathers threat intelligence from authoritative public feeds and returns 
 **deterministic, rule-scored** assessment — risk 0–100, a severity band, and the
 exact reasons behind the score.
 
-The verdict is computed **in code**, not asked of an LLM. A security team can read
-the scoring rules and audit every point. That is the difference between a tool
-they'll run and "the AI said it's bad."
+The verdict is computed **in code**, not asked of an LLM, so every point in the
+score is reproducible and can be audited against the rules in the source.
 
 ```text
 $ ioc-triage CVE-2021-44228
@@ -38,9 +37,8 @@ black box.
 | **Domain** | VirusTotal v3 + URLhaus active-malware-host feed (corroborated) + domain creation date |
 | **CVE** | CISA KEV (actively exploited? ransomware-linked?) · EPSS (exploit probability) · NVD (CVSS) |
 
-All sources are free and licence-clean. No scraping, no dark-web crawling — the
-real-world-exploitation signal (CISA KEV + EPSS) is what commercial "zero-day
-intel" is mostly selling anyway, from an authoritative source.
+All sources are free, public, and licence-clean. The exploitation signals (CISA
+KEV and EPSS) come directly from authoritative upstreams.
 
 ## Multiple sources, corroborated
 
@@ -50,8 +48,8 @@ many agree** — one source's flag is a lead, not a verdict:
 - **2+ sources flag it strongly** → critical.
 - **1 strong source** → high.
 - **2 sources agree weakly** → medium.
-- **1 weak flag, others clean** → low. *(This is why `8.8.8.8` — flagged by a lone
-  VirusTotal vendor but clean on AbuseIPDB — scores LOW, not a misleading MEDIUM.)*
+- **1 weak flag, others clean** → low. A single low-confidence detection is
+  treated as a lead, not a verdict.
 
 ### Add any feed without touching the code
 
@@ -96,15 +94,36 @@ ioc-triage 45.146.164.110 CVE-2021-44228 --json   # machine-readable for pipelin
 
 ## How the score works
 
-Points accrue from evidence; the total maps to a severity band. The rules live in
-`src/soc_triage/ioc_investigate.py` and are deliberately short and readable:
+Scoring is deterministic and lives in `src/soc_triage/ioc_investigate.py`.
 
-- **CVE in CISA KEV** → +65 (+80 if ransomware-linked). Being exploited in the
-  wild is the strongest signal there is.
+**CVEs** accrue additive points from exploitation evidence:
+
+- **In CISA KEV** → +65, or +80 if linked to ransomware campaigns.
 - **EPSS ≥ 0.5** → +25; **≥ 0.1** → +10.
-- **VirusTotal**: ≥5 malicious → +60; ≥1 → +40; suspicious only → +20.
-- A **clean VirusTotal result scores 0** — absence of detections is *not* proof of
-  benign, and the tool never treats it as such.
+- **CVSS CRITICAL** → +15; **HIGH** → +8.
+
+**IPs and domains** are scored by corroboration across the configured sources.
+Each source returns a normalised verdict with a confidence weight (`strong`,
+`weak`, or none); the aggregate reflects how many independent sources agree:
+
+| Signals | Score | Band |
+|---|---|---|
+| 2 or more strong | 85 | critical |
+| 1 strong + at least 1 weak | 70 | high |
+| 1 strong | 55 | high |
+| 2 or more weak | 40 | medium |
+| 1 weak | 15 | low |
+| none | 0 | informational |
+
+How each source maps to a weight:
+
+- **VirusTotal** — 3 or more vendors malicious → strong; 1–2 → weak; suspicious only → weak.
+- **AbuseIPDB** — abuse confidence ≥ 50 → strong; 25–49 → weak.
+- **URLhaus** — a currently-online malware URL on the host → strong; only historical URLs → weak.
+- **Newly registered domain** — a VirusTotal creation date within 30 days adds a weak signal.
+
+A clean result from any source scores nothing on its own; absence of detections
+is not treated as proof that an indicator is benign.
 
 Bands: `0–9 informational · 10–29 low · 30–54 medium · 55–79 high · 80+ critical`.
 

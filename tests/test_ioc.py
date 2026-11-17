@@ -3,7 +3,7 @@
 Offline tests for ioc_investigate.py -- no network.
 
 Covers classification, the internal-IP guard, CVE scoring, the severity bands,
-and the new CORROBORATION aggregation (including the lone-vendor '8.8.8.8' fix).
+and the corroboration aggregation across multiple connector verdicts.
 Run: python tests/test_ioc.py
 """
 from soc_triage import ioc_investigate as mod
@@ -46,14 +46,14 @@ def test_corroboration():
                                      _r("AbuseIPDB", "suspicious", "weak")])
     check("1 strong + 1 weak -> 70", s == 70)
 
-    # THE 8.8.8.8 FIX: one weak hit, one source says clean -> LOW, not MEDIUM.
+    # One weak detection, another source clean -> low band.
     s, reasons = mod.aggregate_reputation([_r("VirusTotal", "malicious", "weak"),
                                            _r("AbuseIPDB", "clean", "none")])
-    check("lone weak hit -> 15 (LOW)", s == 15)
+    check("lone weak detection -> 15 (low)", s == 15)
     check("severity is low", mod._severity_for(s) == "low")
     check("clean source surfaced", any("clean" in x for x in reasons))
 
-    # Two independent weak hits DO corroborate -> MEDIUM.
+    # Two independent weak detections corroborate -> medium band.
     s, _ = mod.aggregate_reputation([_r("VirusTotal", "malicious", "weak"),
                                      _r("AbuseIPDB", "malicious", "weak")])
     check("2 weak -> 40 (MEDIUM)", s == 40)
@@ -65,7 +65,7 @@ def test_corroboration():
 
 
 def test_cve_scoring():
-    print("CVE scoring (unchanged logic, tuple return):")
+    print("CVE scoring:")
     s, _ = mod.score_cve({"kev": {"known_exploited": True, "known_ransomware_use": "Known"},
                           "epss": {"has_score": True, "epss": 0.94},
                           "nvd": {"cvss_severity": "CRITICAL"}})
@@ -95,8 +95,8 @@ def test_investigate_with_fake_connectors():
         def query(self, ind, k): return self._r
     conns = [FakeConn(_r("VirusTotal", "malicious", "weak")),
              FakeConn(_r("AbuseIPDB", "clean", "none"))]
-    a = mod.investigate("8.8.8.8", conns)
-    check("8.8.8.8 lands LOW, not MEDIUM", a.severity == "low" and a.score == 15)
+    a = mod.investigate("203.0.113.10", conns)
+    check("single weak detection lands low", a.severity == "low" and a.score == 15)
 
 
 if __name__ == "__main__":
