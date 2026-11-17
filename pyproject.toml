@@ -26,14 +26,6 @@ dependencies = [
     "pyyaml>=6,<7",
 ]
 
-[project.optional-dependencies]
-# The LLM agent half (lab/SIEM orchestration) is optional and not needed for
-# standalone IOC triage.
-agent = [
-    "langchain>=0.3,<0.4",
-    "langchain-google-genai>=2,<3",
-]
-
 [project.scripts]
 # After `pip install .` this gives you a real command on your PATH.
 ioc-triage = "soc_triage.ioc_investigate:main"

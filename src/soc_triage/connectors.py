@@ -15,16 +15,13 @@ so the scoring layer never has to know a vendor's private JSON shape:
       "raw":       {...},           # trimmed source-specific fields
     }
 
-New sources are added two ways, neither of which touches the scoring code:
-  * a small subclass (see AbuseIPDBConnector), or
-  * zero code at all via GenericRestConnector, configured in config.yaml.
-
-This is what makes the tool vendor-agnostic: a buyer points it at their own
-feeds by editing YAML, not Python.
+New sources can be added either as a small subclass (see AbuseIPDBConnector) or
+with no code at all via GenericRestConnector, configured in config.yaml. Neither
+path requires changes to the scoring layer.
 """
 from __future__ import annotations
 
-import os
+import time
 import ipaddress
 from typing import Any
 
@@ -133,18 +130,26 @@ class VirusTotalConnector(Connector):
             verdict, weight = "suspicious", "weak"
         else:
             verdict, weight = "clean", "none"
+        creation = attrs.get("creation_date")
+        detail = (f"{mal}/{total or '?'} vendors malicious"
+                  + (f", {susp} suspicious" if susp else ""))
+        # A domain registered within the last 30 days is a weak risk signal in
+        # its own right, even when no vendor has flagged it yet.
+        if indicator_type == "domain" and verdict == "clean" and creation:
+            age_days = (time.time() - creation) / 86400
+            if 0 <= age_days < 30:
+                verdict, weight = "suspicious", "weak"
+                detail = f"domain registered {int(age_days)} day(s) ago; {detail}"
         return {
             "source": "VirusTotal", "available": True, "found": True,
-            "verdict": verdict, "weight": weight,
-            "detail": f"{mal}/{total or '?'} vendors malicious"
-                      + (f", {susp} suspicious" if susp else ""),
+            "verdict": verdict, "weight": weight, "detail": detail,
             "raw": {"malicious": mal, "suspicious": susp, "as_owner": attrs.get("as_owner"),
-                    "country": attrs.get("country"), "creation_date": attrs.get("creation_date")},
+                    "country": attrs.get("country"), "creation_date": creation},
         }
 
 
 # --------------------------------------------------------------------------- #
-# AbuseIPDB  (free API; corroborates IP reputation -> kills lone-vendor noise)
+# AbuseIPDB  --  IP abuse-confidence reputation
 # --------------------------------------------------------------------------- #
 @register
 class AbuseIPDBConnector(Connector):

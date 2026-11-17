@@ -1,32 +1,25 @@
 #!/usr/bin/env python3
 """
-threat_intel.py  --  CVE threat-intelligence enrichment for the SOC agent.
+threat_intel.py  --  CVE threat-intelligence enrichment.
 
-This is the legitimate, production-safe version of "dark-web / zero-day insight":
-instead of crawling Tor markets (legally fraught, unreliable, an OPSEC liability),
-it answers the question an analyst actually needs -- "is this vulnerability being
-exploited in the wild right now, and how likely is it to be?" -- from free,
-authoritative, licence-clean sources:
+Answers whether a CVE is being exploited in the wild, and how likely it is to be,
+from free, authoritative, licence-clean sources:
 
-  * CISA KEV   (Known Exploited Vulnerabilities) -- ground truth that a CVE is
-               being actively exploited; includes ransomware-campaign flag.
+  * CISA KEV   (Known Exploited Vulnerabilities) -- confirms a CVE is being
+               actively exploited; includes a ransomware-campaign flag.
   * EPSS       (FIRST.org Exploit Prediction Scoring System) -- probability the
                CVE will be exploited in the next 30 days (0..1) + percentile.
   * NVD        (NIST National Vulnerability Database) -- CVSS base score/severity
                and the canonical description.
 
-Design notes (these are the "product", not the script, parts):
-  * The KEV catalogue is cached on disk with a TTL so we fetch it once, not once
-    per CVE per run.
-  * Every network call retries with backoff and degrades to a clear, structured
-    "unavailable" result instead of raising -- a missing feed is a stated
-    limitation, never fabricated data.
-  * enrich_cve() returns a plain dict (machine-readable); the @tool wrapper
-    serialises it for the agent. No secrets required; an optional NVD_API_KEY
-    raises the NVD rate limit.
-
-Public sources, no credentials needed. NVD allows a free API key for higher
-rate limits (set NVD_API_KEY in the environment if you have one).
+Implementation notes:
+  * The KEV catalogue is cached on disk with a TTL, so it is fetched once rather
+    than once per CVE per run.
+  * Every network call retries with backoff and degrades to a structured
+    "unavailable" result instead of raising; a missing feed is reported, never
+    fabricated.
+  * enrich_cve() returns a plain dict. An optional NVD_API_KEY raises the NVD
+    rate limit; no credentials are otherwise required.
 """
 from __future__ import annotations
 
@@ -52,7 +45,7 @@ RETRIES = 3
 BACKOFF = 1.5  # seconds, exponential
 
 # Cache the (large, slow-changing) KEV catalogue on disk between runs.
-CACHE_DIR = Path(os.getenv("SOC_CACHE_DIR", Path(tempfile.gettempdir()) / "soc_agent_cache"))
+CACHE_DIR = Path(os.getenv("SOC_CACHE_DIR", Path(tempfile.gettempdir()) / "soc_triage_cache"))
 KEV_CACHE = CACHE_DIR / "cisa_kev.json"
 KEV_TTL_SECONDS = 6 * 60 * 60  # 6 hours
 
@@ -64,18 +57,15 @@ CVE_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
 # --------------------------------------------------------------------------- #
 def _get(url: str, *, params: dict | None = None, headers: dict | None = None) -> Optional[requests.Response]:
     """GET with bounded retries. Returns the Response, or None if unreachable."""
-    last_exc = None
     for attempt in range(RETRIES):
         try:
             r = requests.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT)
             # Retry transient server/rate errors; return anything else to caller.
             if r.status_code in (429, 500, 502, 503, 504):
-                last_exc = f"HTTP {r.status_code}"
                 time.sleep(BACKOFF * (2 ** attempt))
                 continue
             return r
-        except requests.RequestException as e:
-            last_exc = e
+        except requests.RequestException:
             time.sleep(BACKOFF * (2 ** attempt))
     return None
 
@@ -265,29 +255,6 @@ def extract_cves(text: str) -> list[str]:
             seen.add(u)
             out.append(u)
     return out
-
-
-# --------------------------------------------------------------------------- #
-# LangChain tool wrapper (import-safe: only defined if langchain is present)
-# --------------------------------------------------------------------------- #
-try:
-    from langchain_core.tools import tool
-
-    @tool
-    def cve_threat_intel(cve: str) -> str:
-        """Enrich a CVE with real-world exploitation intelligence. Returns whether
-        the CVE is actively exploited in the wild (CISA KEV, incl. ransomware
-        use), its EPSS exploitation probability, its CVSS score/severity (NVD),
-        and a single triage priority. Use this for any CVE mentioned in a ticket
-        or its evidence. A CVE's presence in CISA KEV is strong evidence the
-        activity deserves escalation.
-
-        Args:
-            cve: A CVE identifier, e.g. 'CVE-2021-44228'.
-        """
-        return json.dumps(enrich_cve(cve), default=str)[:4000]
-except ImportError:  # module still usable as a plain library without langchain
-    cve_threat_intel = None  # type: ignore
 
 
 if __name__ == "__main__":

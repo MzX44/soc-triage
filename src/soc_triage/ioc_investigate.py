@@ -2,19 +2,19 @@
 """
 ioc_investigate.py  --  standalone IOC investigator (config-driven connectors).
 
-Give it an IP, a domain, or a CVE and it gathers public threat intelligence and
-produces a deterministic, rule-scored assessment. Reputation now comes from
-MULTIPLE connectors (VirusTotal, AbuseIPDB, any feed you add in config.yaml) and
-the score reflects CORROBORATION -- how many independent sources agree -- so a
-lone vendor flag on well-known infrastructure no longer reads as MEDIUM.
+Takes an IP, a domain, or a CVE and produces a deterministic, rule-scored
+assessment. Reputation is drawn from the configured connectors (VirusTotal,
+AbuseIPDB, URLhaus, or any feed declared in config.yaml); IP and domain scores
+reflect how many independent sources corroborate a detection, so a single
+low-confidence flag does not dominate the result.
 
     ioc-triage 45.146.164.110
     ioc-triage suspicious-domain.xyz
     ioc-triage CVE-2021-44228
-    ioc-triage 8.8.8.8 CVE-2021-44228 --json
+    ioc-triage 1.1.1.1 CVE-2021-44228 --json
 
-Verdict is computed in code (auditable); the LLM is not in the loop.
-Internal/CGNAT addresses are refused in-connector before any third-party call.
+The verdict is computed in code; no LLM is involved. Internal and CGNAT
+addresses are refused in-connector before any third-party request.
 """
 from __future__ import annotations
 
@@ -77,11 +77,11 @@ def _severity_for(score: int) -> str:
 
 
 def aggregate_reputation(results: list[dict[str, Any]]) -> tuple[int, list[str]]:
-    """Corroboration-based score for an IP/domain from N connector verdicts.
+    """Corroboration-based score for an IP or domain from N connector verdicts.
 
-    One source's flag is a lead, not a verdict. Points scale with how many
-    INDEPENDENT sources agree, so a single weak hit (e.g. 1/94 on Google DNS)
-    lands at LOW, while two strong hits land at CRITICAL.
+    A single source's flag is treated as a lead, not a verdict. The score scales
+    with the number of independent sources that agree: one weak detection lands
+    at the low band, while two strong detections reach the critical band.
     """
     strong = [r for r in results if r.get("weight") == "strong" and r.get("verdict") == "malicious"]
     weak = [r for r in results if r.get("weight") == "weak" and r.get("verdict") in ("malicious", "suspicious")]
@@ -110,7 +110,7 @@ def aggregate_reputation(results: list[dict[str, Any]]) -> tuple[int, list[str]]
             elif r.get("verdict") == "clean":
                 reasons.append(f"[{r['source']}] clean (not proof of benign)")
     if ns == 0 and nw == 1:
-        reasons.append("Only one source flagged this, weakly — treated as LOW pending corroboration.")
+        reasons.append("Only one source flagged this, with low confidence; scored low pending corroboration.")
     return score, reasons
 
 

@@ -39,13 +39,32 @@ def test_virustotal():
 
     _patch(c, {"data": {"attributes": {"last_analysis_stats":
              {"malicious": 1, "suspicious": 0, "harmless": 93, "undetected": 0}}}})
-    r = c.query("8.8.8.8", "ip")
+    r = c.query("203.0.113.10", "ip")
     check("1 malicious -> weak", r["verdict"] == "malicious" and r["weight"] == "weak")
 
     _patch(c, {"data": {"attributes": {"last_analysis_stats":
              {"malicious": 0, "suspicious": 0, "harmless": 94, "undetected": 0}}}})
-    r = c.query("8.8.8.8", "ip")
+    r = c.query("203.0.113.10", "ip")
     check("0 malicious -> clean/none", r["verdict"] == "clean" and r["weight"] == "none")
+
+
+def test_virustotal_new_domain():
+    print("VirusTotal newly-registered-domain signal:")
+    import time as _time
+    c = C.VirusTotalConnector(api_key="x")
+    clean_stats = {"last_analysis_stats": {"malicious": 0, "suspicious": 0,
+                                           "harmless": 90, "undetected": 0}}
+    # Clean domain registered 5 days ago -> weak suspicious.
+    _patch(c, {"data": {"attributes": {**clean_stats,
+             "creation_date": int(_time.time()) - 5 * 86400}}})
+    r = c.query("brand-new.example", "domain")
+    check("recent clean domain -> weak suspicious",
+          r["verdict"] == "suspicious" and r["weight"] == "weak")
+    # Clean domain registered years ago -> stays clean.
+    _patch(c, {"data": {"attributes": {**clean_stats,
+             "creation_date": int(_time.time()) - 1000 * 86400}}})
+    r = c.query("old.example", "domain")
+    check("old clean domain -> clean", r["verdict"] == "clean" and r["weight"] == "none")
 
 
 def test_virustotal_internal_refused():
@@ -152,6 +171,7 @@ def test_config_loader():
 if __name__ == "__main__":
     test_virustotal()
     test_virustotal_internal_refused()
+    test_virustotal_new_domain()
     test_abuseipdb()
     test_generic_rest()
     test_urlhaus()
