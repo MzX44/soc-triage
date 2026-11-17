@@ -14,13 +14,16 @@ score is reproducible and can be audited against the rules in the source.
 ```text
 $ ioc-triage CVE-2021-44228
 Indicator : CVE-2021-44228  (cve)
-Severity  : [CRITICAL]  risk score 100/100
+Severity  : [CRITICAL]  risk score 90/100
 Reasons   :
-  - (+80) CISA KEV: actively exploited AND linked to ransomware campaigns.
-  - (+25) EPSS: 94% probability of exploitation in 30 days.
-  - (+15) NVD: CVSS severity CRITICAL.
-Priority  : CRITICAL - actively exploited, linked to ransomware campaigns
+  - CISA KEV: actively exploited AND linked to ransomware campaigns.
+  - EPSS: 97% probability of exploitation in 30 days.
+  - NVD: CVSS v3.1 severity CRITICAL.
+Priority  : CRITICAL
 ```
+
+The exit code reflects the outcome so a pipeline can branch without parsing JSON:
+`0` nothing actionable, `1` a high/critical finding, `2` inconclusive.
 
 ## Why it exists
 
@@ -37,8 +40,9 @@ black box.
 | **Domain** | VirusTotal v3 + URLhaus active-malware-host feed (corroborated) + domain creation date |
 | **CVE** | CISA KEV (actively exploited? ransomware-linked?) · EPSS (exploit probability) · NVD (CVSS) |
 
-All sources are free, public, and licence-clean. The exploitation signals (CISA
-KEV and EPSS) come directly from authoritative upstreams.
+All sources are free and public, and the exploitation signals (CISA KEV and EPSS)
+come directly from authoritative upstreams. They are **not** all cleared for
+commercial resale — see [Licensing and commercial use](#licensing-and-commercial-use).
 
 ## Multiple sources, corroborated
 
@@ -96,11 +100,16 @@ ioc-triage 45.146.164.110 CVE-2021-44228 --json   # machine-readable for pipelin
 
 Scoring is deterministic and lives in `src/soc_triage/ioc_investigate.py`.
 
-**CVEs** accrue additive points from exploitation evidence:
+**CVEs** are scored so the band always agrees with the exploitation evidence.
+Confirmed or predicted exploitation sets a floor that CVSS cannot out-vote:
 
-- **In CISA KEV** → +65, or +80 if linked to ransomware campaigns.
-- **EPSS ≥ 0.5** → +25; **≥ 0.1** → +10.
-- **CVSS CRITICAL** → +15; **HIGH** → +8.
+- **In CISA KEV** → floor at **critical** (80, or 90 if ransomware-linked).
+- **EPSS ≥ 0.5** → floor at **high** (55).
+- Below those floors, **EPSS 0.1–0.5** adds 10 and **CVSS CRITICAL/HIGH** adds 15/8.
+
+The printed priority is derived from the final band, so the score and the
+priority line cannot disagree. CVSS 4.0 is read (not just 3.x/2.0), and if the
+CISA KEV feed cannot be reached the CVE is reported **inconclusive**, not scored.
 
 **IPs and domains** are scored by corroboration across the configured sources.
 Each source returns a normalised verdict with a confidence weight (`strong`,
@@ -127,37 +136,73 @@ is not treated as proof that an indicator is benign.
 
 Bands: `0–9 informational · 10–29 low · 30–54 medium · 55–79 high · 80+ critical`.
 
+**Fail closed, not open.** If every configured source is unreachable (keys
+missing, quota exhausted, or network down), the result is **inconclusive** with
+exit code 2 — never a clean-looking `INFO 0/100`. A missing answer is reported,
+not scored as reassurance.
+
 ## Safety and compliance
 
 - **Bring your own keys.** The tool calls providers with *your* API key, so the
-  terms of use are between you and the provider. **VirusTotal's free/public API is
-  non-commercial** — commercial users need a VirusTotal Premium key.
-- **No internal data leaves your network.** Internal/RFC1918/CGNAT addresses are
-  refused in code before any third-party call.
+  terms of use are between you and the provider (see Licensing below).
+- **No internal data leaves your network.** Internal, loopback, link-local,
+  reserved, CGNAT and IPv4-mapped IPv6 addresses — and internal hostnames
+  (`*.local`, `*.internal`, `*.corp`, single-label names, `localhost`) — are
+  refused in code before any third-party call. Emails, URLs and `host:port`
+  strings are not treated as indicators; defanged input (`evil[.]com`, `hxxp://`)
+  is normalised first.
 - **Decision support, not an oracle.** Output assists an analyst's judgement; it
   is not an authoritative verdict. Provided under the MIT licence with no warranty.
+
+## Licensing and commercial use
+
+The tool's own code is MIT. The **data** each source returns is not: some feeds
+are free for personal or non-profit use but restrict commercial use. These terms
+are between you and each provider (bring-your-own-key). This table is a guide, not
+legal advice — confirm with each provider before charging anyone.
+
+| Source | Free tier | Commercial use |
+|---|---|---|
+| VirusTotal (public API) | 500/day, 4/min | **Not permitted** — commercial users need a VirusTotal Premium key |
+| URLhaus (abuse.ch) | free Auth-Key | Non-profit only; commercial use may require a paid Spamhaus subscription |
+| AbuseIPDB | 1,000/day | Governed by its Terms of Use; confirm before resale |
+| CISA KEV | unlimited | Public domain (CC0) |
+| NVD | free (rate-limited) | Public domain, attribution requested (see below) |
+| EPSS (FIRST) | free API | Check FIRST's terms |
+
+A commercial deployment can set `require_commercial_use: true` in `config.yaml` to
+drop any source not cleared for commercial use (each connector carries a
+`commercial_ok` flag). For a commercial-safe build, abuse.ch's Feodo Tracker and
+SSL Blocklist (CC0) are good drop-in feeds via the generic REST connector.
+
+> This product uses data from the NVD API but is not endorsed or certified by the
+> NVD.
 
 ## Tests
 
 ```bash
-python tests/test_threat_intel.py   # CVE enrichment parsing + priority
-python tests/test_ioc.py            # classification, corroboration scoring, bands
-python tests/test_connectors.py     # each connector's verdict mapping + config loader
+python tests/test_threat_intel.py   # KEV/EPSS/NVD parsing, CVSS 4.0, KEV staleness
+python tests/test_ioc.py            # classify/defang, guards, CVE floors, bands, exit codes
+python tests/test_connectors.py     # verdict mapping, retries, URL-encoding, config loader
 ```
 
 All run with **no network and no keys** — they feed captured samples shaped like
 the real feeds, so they verify the parsing and the scoring, not your connectivity.
-CI runs them on every push (Python 3.10 and 3.12).
+They cover IPv6/mapped/reserved addresses, defanged input, 429 retries,
+all-sources-down (inconclusive), and score-vs-priority consistency. CI runs them
+on every push (Python 3.10 and 3.12).
 
 ## Roadmap
 
 - [x] Multi-source corroboration (VirusTotal + AbuseIPDB + URLhaus)
 - [x] Config-driven, vendor-agnostic connectors (`config.yaml` + generic REST)
 - [x] Domain corroboration (URLhaus host API)
-- [ ] More free enrichers (AlienVault OTX, Spamhaus DROP) via config
+- [x] Inconclusive/fail-closed handling, exit codes, retry + backoff
+- [ ] GreyNoise Community connector (a "known benign / internet noise" signal)
+- [ ] Commercial-safe feeds (Feodo Tracker, SSL Blocklist) and a published accuracy benchmark
 - [ ] Connectors for full ticket investigation (Splunk / Sentinel / Elastic)
-- [ ] CSV / STIX batch mode
-- [ ] Optional LLM narrative summary (BYO provider)
+- [ ] CSV / STIX batch mode, stdin, and concurrency
+- [ ] Optional LLM narrative summary (BYO provider) over a versioned JSON schema
 
 ## License
 

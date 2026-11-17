@@ -19,7 +19,7 @@ classifiers = [
 ]
 
 # Pinned to known-good lower bounds so the tool keeps running for months without
-# a surprise upstream break. The core has only two runtime dependencies.
+# a surprise upstream break. The core has three runtime dependencies.
 dependencies = [
     "requests>=2.31,<3",
     "python-dotenv>=1.0,<2",

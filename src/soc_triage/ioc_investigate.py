@@ -18,6 +18,7 @@ addresses are refused in-connector before any third-party request.
 """
 from __future__ import annotations
 
+import re
 import sys
 import json
 import ipaddress
@@ -32,12 +33,35 @@ from .config import load_connectors
 
 load_dotenv()
 
-# Re-export so callers/tests can use the same guard the connectors use.
+# Re-export so callers/tests can use the same guards the connectors use.
 is_internal_ip = C.is_internal_ip
+is_internal_host = C.is_internal_host
+
+# A bare, well-formed domain name (no scheme, port, path, user, or whitespace).
+_DOMAIN_RE = re.compile(
+    r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))+$"
+)
+
+
+def _refang(value: str) -> str:
+    """Undo common indicator defanging so ``evil[.]com`` and ``hxxp://x`` are
+    normalised before classification (a defanged URL still classifies as a URL,
+    i.e. 'unknown', and is not looked up)."""
+    s = value.strip()
+    for a, b in (("[.]", "."), ("(.)", "."), ("{.}", "."), ("[:]", ":")):
+        s = s.replace(a, b)
+    s = re.sub(r"\[dot\]", ".", s, flags=re.IGNORECASE)
+    s = re.sub(r"(?i)^hxxp(s?)://", r"http\1://", s)
+    return s
 
 
 def classify(indicator: str) -> str:
-    """Return 'ip', 'cve', 'domain', or 'unknown'."""
+    """Return 'ip', 'cve', 'domain', or 'unknown'.
+
+    Only a bare IP, a CVE id, or a bare domain name are recognised. Emails,
+    URLs, host:port strings, paths and anything else return 'unknown' and are
+    never looked up.
+    """
     s = indicator.strip()
     if ti.CVE_RE.fullmatch(s.upper()):
         return "cve"
@@ -46,7 +70,10 @@ def classify(indicator: str) -> str:
         return "ip"
     except ValueError:
         pass
-    if "." in s and " " not in s and "/" not in s:
+    # Reject non-indicator shapes before treating anything as a domain.
+    if any(c in s for c in "@/\\ \t") or ":" in s:
+        return "unknown"
+    if _DOMAIN_RE.fullmatch(s.strip(".")):
         return "domain"
     return "unknown"
 
@@ -60,8 +87,17 @@ class Assessment:
     kind: str
     score: int = 0
     severity: str = "informational"
+    priority: str = "INFO"
     reasons: list[str] = field(default_factory=list)
     evidence: dict[str, Any] = field(default_factory=dict)
+
+
+# A single severity -> priority mapping, so the band and the printed priority can
+# never disagree (they are derived from the same score).
+_PRIORITY = {
+    "critical": "CRITICAL", "high": "HIGH", "medium": "ELEVATED",
+    "low": "LOW", "informational": "INFO", "inconclusive": "INCONCLUSIVE",
+}
 
 
 def _severity_for(score: int) -> str:
@@ -115,55 +151,101 @@ def aggregate_reputation(results: list[dict[str, Any]]) -> tuple[int, list[str]]
 
 
 def score_cve(enr: dict[str, Any]) -> tuple[int, list[str]]:
+    """Score a CVE so the band agrees with exploitation evidence.
+
+    KEV membership is a floor at the critical band and EPSS >= 0.5 is a floor at
+    the high band, because confirmed or predicted exploitation should not be
+    out-voted by a CVSS modifier. CVSS and mid-range EPSS only add below those
+    floors. This keeps the band and the printed priority consistent.
+    """
     kev, epss, nvd = enr.get("kev", {}), enr.get("epss", {}), enr.get("nvd", {})
-    score, reasons = 0, []
+    reasons: list[str] = []
+
+    kev_floor = 0
     if kev.get("known_exploited"):
         if str(kev.get("known_ransomware_use", "")).lower() == "known":
-            score += 80
+            kev_floor = 90
             reasons.append("CISA KEV: actively exploited AND linked to ransomware campaigns.")
         else:
-            score += 65
+            kev_floor = 80
             reasons.append("CISA KEV: actively exploited in the wild.")
+
+    epss_floor = add = 0
     if epss.get("has_score"):
         p = epss.get("epss", 0)
         if p >= 0.5:
-            score += 25
+            epss_floor = 55
             reasons.append(f"EPSS: {p:.0%} probability of exploitation in 30 days.")
         elif p >= 0.1:
-            score += 10
+            add += 10
             reasons.append(f"EPSS: {p:.0%} probability of exploitation in 30 days.")
+
     sev = str(nvd.get("cvss_severity", "")).upper()
+    ver = nvd.get("cvss_version")
+    label = f"CVSS {('v' + ver + ' ') if ver else ''}severity {sev}"
     if sev == "CRITICAL":
-        score += 15
-        reasons.append("NVD: CVSS severity CRITICAL.")
+        add += 15
+        reasons.append(f"NVD: {label}.")
     elif sev == "HIGH":
-        score += 8
-        reasons.append("NVD: CVSS severity HIGH.")
-    return score, reasons
+        add += 8
+        reasons.append(f"NVD: {label}.")
+
+    return min(max(kev_floor, epss_floor, add), 100), reasons
+
+
+def _investigate_network(a: Assessment, indicator: str, kind: str,
+                         conns: list[C.Connector] | None) -> None:
+    if conns is None:
+        conns = load_connectors()
+    results = [c.lookup(indicator, kind) for c in conns if c.handles(kind)]
+    a.evidence["sources"] = results
+    answered = [r for r in results if r.get("available")]
+    refused = [r for r in results if r.get("refused")]
+    a.evidence["coverage"] = {"answered": len(answered), "configured": len(results)}
+
+    if not results:
+        a.severity = "inconclusive"
+        a.reasons.append("No enrichment source is configured for this indicator type.")
+        return
+    if not answered:
+        if refused:
+            a.severity = "informational"
+            a.reasons.append("Internal/non-public indicator; not sent to third parties and not scored.")
+        else:
+            a.severity = "inconclusive"
+            a.reasons.append("No source could be reached (keys missing, quota exhausted, or "
+                             "network down); result is inconclusive, not clean.")
+            for r in results:
+                a.reasons.append(f"[{r['source']}] unavailable: {r.get('detail', '')}")
+        return
+    a.score, a.reasons = aggregate_reputation(results)
+    a.severity = _severity_for(a.score)
 
 
 def investigate(indicator: str, conns: list[C.Connector] | None = None) -> Assessment:
-    kind = classify(indicator)
-    a = Assessment(indicator=indicator, kind=kind)
+    norm = _refang(indicator)
+    kind = classify(norm)
+    a = Assessment(indicator=norm, kind=kind)
 
     if kind == "cve":
-        enr = ti.enrich_cve(indicator)
+        enr = ti.enrich_cve(norm)
         a.evidence["cve_intel"] = enr
-        a.score, a.reasons = score_cve(enr)
-    elif kind in ("ip", "domain"):
-        if conns is None:
-            conns = load_connectors()
-        results = [c.query(indicator, kind) for c in conns if c.handles(kind)]
-        a.evidence["sources"] = results
-        if results:
-            a.score, a.reasons = aggregate_reputation(results)
+        if not enr.get("kev", {}).get("available", False):
+            a.severity = "inconclusive"
+            a.reasons.append("CISA KEV feed unavailable; exploitation status unknown, so the "
+                             "result is inconclusive rather than scored.")
         else:
-            a.reasons.append("No enrichment source is configured for this indicator type.")
+            a.score, a.reasons = score_cve(enr)
+            a.severity = _severity_for(a.score)
+    elif kind in ("ip", "domain"):
+        _investigate_network(a, norm, kind, conns)
     else:
-        a.reasons.append("Unrecognised indicator type (expected IP, domain, or CVE).")
+        a.severity = "informational"
+        a.reasons.append("Unrecognised indicator (expected a bare IP, domain, or CVE id); "
+                         "not looked up.")
 
     a.score = min(a.score, 100)
-    a.severity = _severity_for(a.score)
+    a.priority = _PRIORITY.get(a.severity, "INFO")
     return a
 
 
@@ -171,20 +253,30 @@ def investigate(indicator: str, conns: list[C.Connector] | None = None) -> Asses
 # Rendering / CLI
 # --------------------------------------------------------------------------- #
 _BADGE = {"critical": "CRITICAL", "high": "HIGH", "medium": "MEDIUM",
-          "low": "LOW", "informational": "INFO"}
+          "low": "LOW", "informational": "INFO", "inconclusive": "INCONCLUSIVE"}
 
 
 def render(a: Assessment) -> str:
-    lines = [
-        f"Indicator : {a.indicator}  ({a.kind})",
-        f"Severity  : [{_BADGE[a.severity]}]  risk score {a.score}/100",
-        "Reasons   :",
-    ]
+    if a.severity == "inconclusive":
+        head = f"Severity  : [{_BADGE[a.severity]}]  risk not assessed"
+    else:
+        head = f"Severity  : [{_BADGE[a.severity]}]  risk score {a.score}/100"
+    lines = [f"Indicator : {a.indicator}  ({a.kind})", head, "Reasons   :"]
     for r in a.reasons:
         lines.append(f"  - {r}")
-    if a.kind == "cve":
-        lines.append(f"Priority  : {a.evidence.get('cve_intel', {}).get('priority', 'n/a')}")
+    lines.append(f"Priority  : {a.priority}")
     return "\n".join(lines)
+
+
+def _exit_code(results: list[Assessment]) -> int:
+    """0 = nothing actionable, 1 = a high/critical finding, 2 = inconclusive.
+    Lets a SOAR playbook or shell script branch without parsing JSON."""
+    sev = {a.severity for a in results}
+    if "inconclusive" in sev:
+        return 2
+    if sev & {"high", "critical"}:
+        return 1
+    return 0
 
 
 def main() -> None:
@@ -192,13 +284,14 @@ def main() -> None:
     as_json = "--json" in sys.argv
     if not args:
         print("Usage: ioc-triage <IP|domain|CVE> [more...] [--json]")
-        sys.exit(1)
+        sys.exit(2)
     conns = load_connectors()  # built once, reused across indicators
     results = [investigate(x, conns) for x in args]
     if as_json:
         print(json.dumps([asdict(a) for a in results], indent=2, default=str))
     else:
         print("\n\n".join(render(a) for a in results))
+    sys.exit(_exit_code(results))
 
 
 if __name__ == "__main__":
